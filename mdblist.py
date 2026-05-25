@@ -415,7 +415,12 @@ def fetch_watchlist(mediatype=None, cursor=None, limit=20):
     params = {'limit': limit}
     if cursor:
         params['cursor'] = cursor
-    data = _get('watchlist/items', params)
+    path = (
+        f'watchlist/items/{mediatype}'
+        if mediatype in ('movie', 'show')
+        else 'watchlist/items'
+    )
+    data = _get(path, params)
     if data is None:
         return [], None
     if isinstance(data, list):
