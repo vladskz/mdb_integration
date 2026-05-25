@@ -2,7 +2,7 @@
 """
 mdblist.py — Self-contained MDBList plugin module for Kodi addons
 =================================================================
-Version: 2.0.0
+Version: 3.0.0
 
 DROP-IN INTEGRATION (3 steps)
 ------------------------------
@@ -62,6 +62,12 @@ AUTHENTICATION
   Write (supporter) → Bearer token via OAuth2 Device Code flow
                       Triggered by the "Connect MDBList Account" menu item.
                       Token is saved/refreshed automatically.
+
+PAGINATION
+----------
+  List items and watchlist use cursor-based pagination (preferred by the API).
+  Pass next_cursor from one page into the next request; no cursor = first page.
+  Popular lists and Up Next use offset-based pagination (API limitation).
 """
 
 import sys
@@ -377,34 +383,56 @@ def search_lists(query, offset=0, limit=20):
     return data if isinstance(data, list) else data.get('lists', [])
 
 
-def fetch_list_items(list_id, page=1, limit=20):
-    offset = (int(page) - 1) * int(limit)
-    data = _get(f'lists/{list_id}/items', {'offset': offset, 'limit': limit})
+def fetch_list_items(list_id, cursor=None, limit=20):
+    """Fetch one page of list items using cursor pagination.
+
+    Returns (items, next_cursor). Pass next_cursor back on the next call to
+    get the following page; None means you are on the last page.
+    """
+    params = {'limit': limit}
+    if cursor:
+        params['cursor'] = cursor
+    data = _get(f'lists/{list_id}/items', params)
     if data is None:
-        return [], 0
-    if isinstance(data, dict):
-        items = data.get('items') or data.get('movies', []) + data.get('shows', [])
-        total = int(data.get('total_items', 0) or data.get('total', len(items)))
-        return items, total
-    return data, len(data)
+        return [], None
+    if isinstance(data, list):
+        return data, None
+    items = data.get('movies', []) + data.get('shows', [])
+    next_cursor = (data.get('pagination') or {}).get('next_cursor')
+    return items, next_cursor
 
 
 # ---------------------------------------------------------------------------
 # API — Watchlist
 # ---------------------------------------------------------------------------
 
-def fetch_watchlist(mediatype=None):
-    params = {'mediatype': mediatype} if mediatype else {}
-    data = _get('watchlist/items', params)
+def fetch_watchlist(mediatype=None, cursor=None, limit=20):
+    """Fetch one page of watchlist items using cursor pagination.
+
+    Returns (items, next_cursor). Pass next_cursor back on the next call to
+    get the following page; None means you are on the last page.
+    """
+    params = {'limit': limit}
+    if cursor:
+        params['cursor'] = cursor
+    path = (
+        f'watchlist/items/{mediatype}'
+        if mediatype in ('movie', 'show')
+        else 'watchlist/items'
+    )
+    data = _get(path, params)
     if data is None:
-        return []
+        return [], None
     if isinstance(data, list):
-        return data
+        return data, None
     if mediatype == 'movie':
-        return data.get('movies', [])
-    if mediatype == 'show':
-        return data.get('shows', [])
-    return data.get('movies', []) + data.get('shows', [])
+        items = data.get('movies', [])
+    elif mediatype == 'show':
+        items = data.get('shows', [])
+    else:
+        items = data.get('movies', []) + data.get('shows', [])
+    next_cursor = (data.get('pagination') or {}).get('next_cursor')
+    return items, next_cursor
 
 
 def _watchlist_payload(imdb_id, tmdb_id, mediatype):
@@ -451,8 +479,12 @@ def watchlist_remove(imdb_id=None, tmdb_id=None, mediatype='movie'):
 # API — Up Next
 # ---------------------------------------------------------------------------
 
-def fetch_upnext(page=1, limit=20):
-    offset = (int(page) - 1) * int(limit)
+def fetch_upnext(offset=0, limit=20):
+    """Fetch one page of Up Next items using offset pagination.
+
+    The API does not yet support cursor pagination for this endpoint.
+    Returns (items, has_more).
+    """
     data = _get('upnext', {'limit': limit, 'offset': offset, 'hide_unreleased': 'true'})
     if data is None:
         return [], False
@@ -605,7 +637,7 @@ def _render_list_folders(lists, empty_label='[No Lists Found]'):
             suffix = f'  [{", ".join(parts)}]' if parts else ''
             li = xbmcgui.ListItem(label=f'{name}{suffix}')
             li.getVideoInfoTag().setTitle(name)
-            _add_dir(_build_url({'action': 'mdblist_view_list', 'list_id': str(list_id), 'page': 1}), li, True)
+            _add_dir(_build_url({'action': 'mdblist_view_list', 'list_id': str(list_id)}), li, True)
     _end()
 
 
@@ -625,7 +657,7 @@ def _view_popular(offset=0):
             name    = lst.get('name', 'Unnamed List')
             list_id = lst.get('id')
             li = xbmcgui.ListItem(label=name)
-            _add_dir(_build_url({'action': 'mdblist_view_list', 'list_id': str(list_id), 'page': 1}), li, True)
+            _add_dir(_build_url({'action': 'mdblist_view_list', 'list_id': str(list_id)}), li, True)
         if len(lists) == limit:
             next_li = xbmcgui.ListItem(label='Next Page')
             _add_dir(_build_url({'action': 'mdblist_popular', 'offset': int(offset) + limit}), next_li, True)
@@ -647,10 +679,11 @@ def _view_search(query=None):
     _render_list_folders(search_lists(query), f'[No results for "{query}"]')
 
 
-def _view_list_contents(list_id, page=1):
+def _view_list_contents(list_id, cursor=None):
+    """Render one page of list items, threading cursor through the Next Page URL."""
     xbmcplugin.setContent(_HANDLE, 'videos')
     limit = _page_limit()
-    items, total = fetch_list_items(list_id, page=int(page), limit=limit)
+    items, next_cursor = fetch_list_items(list_id, cursor=cursor or None, limit=limit)
     if not items:
         _empty('[No Items Found]')
         _end()
@@ -658,9 +691,12 @@ def _view_list_contents(list_id, page=1):
     for item in items:
         url, li, is_folder = _build_list_item(item)
         _add_dir(url, li, is_folder)
-    if total > int(page) * limit:
-        next_li = xbmcgui.ListItem(label=f'Next Page ({int(page) + 1})')
-        _add_dir(_build_url({'action': 'mdblist_view_list', 'list_id': list_id, 'page': int(page) + 1}), next_li, True)
+    if next_cursor:
+        next_li = xbmcgui.ListItem(label='Next Page')
+        _add_dir(
+            _build_url({'action': 'mdblist_view_list', 'list_id': list_id, 'cursor': next_cursor}),
+            next_li, True,
+        )
     _end()
 
 
@@ -672,40 +708,42 @@ def _view_watchlist_menu():
     ]:
         li = xbmcgui.ListItem(label=label)
         li.setArt({'icon': icon})
-        _add_dir(_build_url({'action': 'mdblist_watchlist_items', 'mediatype': mediatype, 'page': 1}), li, True)
+        _add_dir(_build_url({'action': 'mdblist_watchlist_items', 'mediatype': mediatype}), li, True)
     _end()
 
 
-def _view_watchlist_items(mediatype, page=1):
+def _view_watchlist_items(mediatype, cursor=None):
+    """Render one page of watchlist items, threading cursor through the Next Page URL."""
     kodi_content = 'movies' if mediatype == 'movie' else 'tvshows'
     xbmcplugin.setContent(_HANDLE, kodi_content)
-    limit    = _page_limit()
-    page     = int(page)
-    all_items = fetch_watchlist(mediatype=mediatype)
+    limit = _page_limit()
+    items, next_cursor = fetch_watchlist(mediatype=mediatype, cursor=cursor or None, limit=limit)
 
     empty_label = '[No Movies in Watchlist]' if mediatype == 'movie' else '[No Shows in Watchlist]'
-    if not all_items:
+    if not items:
         _empty(empty_label)
         _end()
         return
 
-    start = (page - 1) * limit
-    for item in all_items[start:start + limit]:
+    for item in items:
         url, li, is_folder = _build_list_item(item, mediatype_override=mediatype)
         _add_dir(url, li, is_folder)
 
-    if page * limit < len(all_items):
-        next_li = xbmcgui.ListItem(label=f'Next Page ({page + 1})')
-        _add_dir(_build_url({'action': 'mdblist_watchlist_items', 'mediatype': mediatype, 'page': page + 1}), next_li, True)
+    if next_cursor:
+        next_li = xbmcgui.ListItem(label='Next Page')
+        _add_dir(
+            _build_url({'action': 'mdblist_watchlist_items', 'mediatype': mediatype, 'cursor': next_cursor}),
+            next_li, True,
+        )
 
     _end()
 
 
-def _view_upnext(page=1):
+def _view_upnext(offset=0):
     xbmcplugin.setContent(_HANDLE, 'episodes')
-    limit    = _page_limit()
-    page     = int(page)
-    items, has_more = fetch_upnext(page=page, limit=limit)
+    limit  = _page_limit()
+    offset = int(offset)
+    items, has_more = fetch_upnext(offset=offset, limit=limit)
 
     if not items:
         _empty('[No Next Episodes Found]')
@@ -791,8 +829,8 @@ def _view_upnext(page=1):
         _add_dir(play_url, li, False)
 
     if has_more:
-        next_li = xbmcgui.ListItem(label=f'Next Page ({page + 1})')
-        _add_dir(_build_url({'action': 'mdblist_upnext', 'page': page + 1}), next_li, True)
+        next_li = xbmcgui.ListItem(label='Next Page')
+        _add_dir(_build_url({'action': 'mdblist_upnext', 'offset': offset + limit}), next_li, True)
 
     _end()
 
@@ -848,13 +886,13 @@ def handle_mdblist_action(params, handle, base_url, addon):
         _view_search(params.get('query'))
 
     elif action == 'mdblist_view_list':
-        _view_list_contents(params['list_id'], params.get('page', 1))
+        _view_list_contents(params['list_id'], params.get('cursor'))
 
     elif action == 'mdblist_watchlist_menu':
         _view_watchlist_menu()
 
     elif action == 'mdblist_watchlist_items':
-        _view_watchlist_items(params.get('mediatype', 'movie'), params.get('page', 1))
+        _view_watchlist_items(params.get('mediatype', 'movie'), params.get('cursor'))
 
     elif action == 'mdblist_watchlist_add':
         watchlist_add(
@@ -871,7 +909,7 @@ def handle_mdblist_action(params, handle, base_url, addon):
         )
 
     elif action == 'mdblist_upnext':
-        _view_upnext(params.get('page', 1))
+        _view_upnext(params.get('offset', 0))
 
     else:
         xbmc.log(f'[mdblist] Unknown action: {action}', xbmc.LOGWARNING)
